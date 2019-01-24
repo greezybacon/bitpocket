@@ -16,8 +16,8 @@ describe 'bitpocket locking' do
   end
 
   it "exits with status 3 when can't acquire remote lock" do
-    mkdir remote_path('.bitpocket/tmp/lock')
-    cat 'remote-host:0:0', remote_path('.bitpocket/tmp/lock/remote')
+    mkdir remote_path('.bitpocket/tmp/remotelock.d')
+    cat 'remote-host:0:0:', remote_path('.bitpocket/tmp/remotelock.d/remote-host')
 
     sync.should exit_with(3)
   end
@@ -31,13 +31,20 @@ describe 'bitpocket locking' do
   it 'should release remote lock after successful sync' do
     sync.should succeed
 
-    remote_path('.bitpocket/tmp/lock').should_not exist
+    remote_path('.bitpocket/tmp/remotelock.d/' + %x[hostname].rstrip).should_not exist
+  end
+
+  it "exits with status 6 when stale remote lock file exists" do
+    cat %x[hostname].rstrip + ':' + max_pid.to_s + ':0:',
+        remote_path('.bitpocket/tmp/remotelock.d/' + %x[hostname].rstrip )
+
+    sync.should exit_with(6)
   end
 
   it 'should cleanup remote stale lock files if forced' do
-    cat %x[hostname].rstrip + ':' + max_pid.to_s + ':0', remote_path('.bitpocket/tmp/lock/remote')
+    cat %x[hostname].rstrip + ':' + max_pid.to_s + ':0:',
+        remote_path('.bitpocket/tmp/remotelock.d/' + %x[hostname].rstrip )
 
-    sync.should exit_with(6)
     sync(:flags => '-f').should succeed
   end
 

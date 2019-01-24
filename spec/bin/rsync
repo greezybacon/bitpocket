@@ -1,11 +1,14 @@
 #!/bin/bash
 
 /usr/bin/rsync "$@"
+status=$?
 
 if [[ $CALLBACK == 'add_after' && "${!#}" != "." ]]; then
   touch after
 fi
 
 if [[ $CALLBACK == 'remove_after' && "${!#}" != "." ]]; then
-  rm after
+  rm -f after
 fi
+
+exit $status

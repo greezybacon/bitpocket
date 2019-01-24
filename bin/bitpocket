@@ -13,6 +13,7 @@ CFG_FILE="$DOT_DIR/config"
 TMP_DIR="$DOT_DIR/tmp"
 STATE_DIR="$DOT_DIR/state"
 LOCK_DIR="$TMP_DIR/lock"  # Use a lock directory for atomic locks. See the Bash FAQ http://mywiki.wooledge.org/BashFAQ/045
+REMOTE_LOCK_DIR="$TMP_DIR/remotelock.d"
 
 # Default settings
 SLOW_SYNC_TIME=10
@@ -22,6 +23,7 @@ REMOTE_BACKUPS=false
 BACKUPS=true
 LOCAL_MOUNTPOINT=false
 REMOTE_MOUNTPOINT=false
+USE_REMOTE_SHELL=true
 
 # Default command-line options and such
 COMMANDS=()
@@ -122,9 +124,17 @@ function init {
 
   REMOTE_PATH="$1"
   setup_remote
-  if $REMOTE_RUNNER "[ ! -d '$1' ]"; then
-    echo "fatal: '$REMOTE': Remote path is not accessible"
-    exit 128
+  if $USE_REMOTE_SHELL; then
+    if $REMOTE_RUNNER "[ ! -d '$1' ]"; then
+      echo "fatal: '$REMOTE': Remote path is not accessible"
+      exit 128
+    fi
+  else
+    if ! rsync --list-only --include="." --exclude="**" "$REMOTE/"
+    then
+      echo "fatal: '$REMOTE': Remote path is not accessible"
+      exit 128
+    fi
   fi
 
   mkdir "$DOT_DIR"
@@ -289,7 +299,7 @@ function push() {
 
   # Some versions of rsync will create the backup dir, even if it doesn't get
   # populated with any backups
-  if [[ $REMOTE_BACKUPS == true ]]
+  if [[ $REMOTE_BACKUPS == true && $USE_REMOTE_SHELL ]]
   then
       $REMOTE_RUNNER "
       cd '$REMOTE_PATH'
@@ -588,64 +598,69 @@ function release_lock {
 }
 
 function acquire_remote_lock {
-    # TODO: Place the local hostname and this PID in a file, which will make
-    # automatic lock file cleanup possible. It will also offer better output if
-    # another host is truly syncing with the remote host.
+    [[ -d "$REMOTE_LOCK_DIR" ]] || mkdir -p "$REMOTE_LOCK_DIR"
+
+    # Create and send a lock file to the remote host
     local INFO="$HOSTNAME:$$:$TIMESTAMP"
-    local REMOTE_INFO=$($REMOTE_RUNNER "
-        mkdir -p '$REMOTE_TMP_DIR' && cd '$REMOTE_PATH'
-        [[ -d '$LOCK_DIR' ]] || mkdir '$LOCK_DIR'
-        [[ -e '$LOCK_DIR'/remote ]] || echo '$INFO' > '$LOCK_DIR'/remote
-        cat '$LOCK_DIR'/remote")
+    echo $INFO > "$REMOTE_LOCK_DIR/$HOSTNAME"
 
-    [[ "$INFO" == "$REMOTE_INFO" ]] && return 0
+    (
+        # Create a remote lock file, then
+        rsync -auR --ignore-existing "$REMOTE_LOCK_DIR/" "$REMOTE/" && \
+        # pull all remote locks local to inspect
+        rsync -a --delete "$REMOTE/$REMOTE_LOCK_DIR/" "$REMOTE_LOCK_DIR/"
+    ) \
+    || die "Couldn't acquire remote lock or lock file couldn't be created. Exiting."
 
-    IFS=":" read -ra INFO <<< "$REMOTE_INFO"
-
-    # From here down, assume the lock could not be acquired
-    local code=3
-    if [[ -z $REMOTE_INFO ]]
-    then
-        echo "Couldn't acquire remote lock or lock file couldn't be created. Exiting."
-    elif [[ "$HOSTNAME" != "${INFO[0]}" ]]
-    then
-        echo -e "${YELLOW}Another client is syncing with '$REMOTE'${CLEAR}"
-        echo ">> Host:    ${INFO[0]}"
-        echo ">> PID:     ${INFO[1]}"
-        echo ">> Started: ${INFO[2]}"
-    elif [[ "$$" != "${INFO[1]}" ]]
-    then
-        # This host is syncing with the remote host. Check if the PID is still running
-        if kill -0 "${INFO[1]}" &>/dev/null
+    local code=0
+    for lock in "$REMOTE_LOCK_DIR"/*
+    do
+        IFS=":" read -ra INFO < "$lock"
+        if [[ "$HOSTNAME" != "${INFO[0]}" ]]
         then
-            # XXX: This should be handled in the `acquire_lock` function
-            echo "Another instance of Bitpocket is currently syncing this" \
-                 "host with '$REMOTE'"
-            code=1
-        else
-            # In this case, this host is holding the lock with the remote server
-            # but the sync is no longer running. It is perhaps possible to remove
-            # the lock?
-            if [[ "${OPTIONS[*]}" =~ force ]]
+                # Another host is syncing. Perhaps expire it?
+                echo -e "${YELLOW}Another client is syncing with '$REMOTE'${CLEAR}"
+                echo ">> Host:    ${INFO[0]}"
+                echo ">> PID:     ${INFO[1]}"
+                echo ">> Started: ${INFO[2]:-some time in the past?} UTC"
+                echo ">> Expires: ${INFO[3]:-never}"
+                code=3
+        elif [[ "$$" != "${INFO[1]}" ]]
+        then
+            if kill -0 "${INFO[1]}" &>/dev/null
             then
-                echo -e "${YELLOW}Removing stale, remote lock file${CLEAR}"
-                $REMOTE_RUNNER "cd '$REMOTE_PATH' && rm '$LOCK_DIR/remote' && rmdir '$LOCK_DIR'"
-                # Try again
-                acquire_remote_lock && return 0
+                echo "Another instance of Bitpocket is currently syncing this" \
+                     "host with '$REMOTE'"
+                code=1
+            elif [[ "${OPTIONS[*]}" =~ force ]]
+            then
+                # Lock exists for this client but process is not running
+                echo -e "${YELLOW}Ignoring stale, remote lock file${CLEAR}"
+                # The lock will be cleaned up after the script. The sync will
+                # continue unless another lock file indicates that syncing
+                # should not proceed.
+            else
+                # Lock is for this host, and not running, and not forced to be removed
+                echo "The remote lock is held by this host and is stale." \
+                     "It should be removed, and the sync should be retried."
+                code=6
             fi
-
-            echo "The remote lock is held by this host and is stale." \
-                 "It should be removed, and the sync should be retried."
-            code=6
         fi
-    fi
+    done
 
-    release_lock
-    exit $code
+    if [[ $code -ne 0 ]]
+    then
+        release_lock && release_remote_lock
+        exit $code
+    fi
 }
 
 function release_remote_lock {
-  $REMOTE_RUNNER "cd \"$REMOTE_PATH\" && grep -q '$HOSTNAME:$$' '$LOCK_DIR/remote' && rm '$LOCK_DIR/remote' && rmdir '$LOCK_DIR' &>/dev/null"
+    rm "$REMOTE_LOCK_DIR/$HOSTNAME"
+    # Protect all files from delete except our lock
+    rsync -auR --delete \
+        --filter="R /$REMOTE_LOCK_DIR/$HOSTNAME" --filter="P **" \
+        "$REMOTE_LOCK_DIR/" "$REMOTE/"
 }
 
 function assert_dotdir {
@@ -688,6 +703,12 @@ function assert_mountpoints {
         if [[ "${REMOTE_PATH:0:${#REMOTE_MOUNTPOINT}}" != "${REMOTE_MOUNTPOINT}" ]]
         then
             echo -e "${YELLOW}warning: Remote mount point is not a parent of '${REMOTE_PATH}'${CLEAR}"
+        fi
+
+        # Checking requires a remote shell (for now)
+        if [[ ${USE_REMOTE_SHELL} == false ]]
+        then
+            die "REMOTE_MOUNTPOINT check requires USE_REMOTE_SHELL=true"
         fi
 
         $REMOTE_RUNNER "mount | grep -E '\s${REMOTE_MOUNTPOINT}\s'" &> /dev/null
