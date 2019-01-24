@@ -55,6 +55,14 @@ describe 'bitpocket locking' do
     sync(:flags => '-f').should succeed
   end
 
+  it 'should proceed with expired remote lock' do
+    mkdir remote_path('.bitpocket/tmp/remotelock.d')
+    cat "remote-host:0:0:#{(Time.now).to_i}",
+        remote_path('.bitpocket/tmp/remotelock.d/remote-host')
+
+    sync.should succeed
+  end
+
   def max_pid
     if RUBY_PLATFORM =~ /darwin/
       99998

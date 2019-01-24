@@ -23,6 +23,7 @@ REMOTE_BACKUPS=false
 BACKUPS=true
 LOCAL_MOUNTPOINT=false
 REMOTE_MOUNTPOINT=false
+REMOTE_LOCK_TIME=false
 USE_REMOTE_SHELL=true
 
 # Default command-line options and such
@@ -172,6 +173,11 @@ REMOTE_BACKUPS=false
 ## result in all local or remote data disappearing. Give the expected
 ## mountpoint of the local and/or remote target.
 # REMOTE_MOUNTPOINT=/
+
+## Change the amount of time for which remote locks are valid. The default is
+## indefinite, but can be changed to a resonable value, such as 30 minutes.
+## After this timeout, other clients will be allowed to sync with the remote.
+# REMOTE_LOCK_TIME=1800
 EOF
 
   echo "Initialized bitpocket directory at $(pwd)"
@@ -600,8 +606,12 @@ function release_lock {
 function acquire_remote_lock {
     [[ -d "$REMOTE_LOCK_DIR" ]] || mkdir -p "$REMOTE_LOCK_DIR"
 
+    [[ $REMOTE_LOCK_TIME != false ]] && \
+    local EXPIRY=$(TZ=UTC date "+%s" -d "+${REMOTE_LOCK_TIME} secs")
+    local NOW=$(TZ=UTC date "+%s")
+
     # Create and send a lock file to the remote host
-    local INFO="$HOSTNAME:$$:$TIMESTAMP"
+    local INFO="$HOSTNAME:$$:$TIMESTAMP:$EXPIRY"
     echo $INFO > "$REMOTE_LOCK_DIR/$HOSTNAME"
 
     (
@@ -618,13 +628,21 @@ function acquire_remote_lock {
         IFS=":" read -ra INFO < "$lock"
         if [[ "$HOSTNAME" != "${INFO[0]}" ]]
         then
+            if [[ -n ${INFO[3]} && $NOW -ge ${INFO[3]} ]]
+            then
+                # Remote lock has expired
+                echo -e "${YELLOW}Ignoring expired, remote lock file (owned by ${INFO[0]})${CLEAR}"
+                rm "$lock"
+                # TODO: Use RSYNC to remove the lock file remotely
+            else
                 # Another host is syncing. Perhaps expire it?
                 echo -e "${YELLOW}Another client is syncing with '$REMOTE'${CLEAR}"
                 echo ">> Host:    ${INFO[0]}"
                 echo ">> PID:     ${INFO[1]}"
-                echo ">> Started: ${INFO[2]:-some time in the past?} UTC"
-                echo ">> Expires: ${INFO[3]:-never}"
+                echo ">> Started: ${INFO[2]:-some time in the past?}"
+                echo ">> Expires: $(date -d "@${INFO[3]:-never}" -R)"
                 code=3
+            fi
         elif [[ "$$" != "${INFO[1]}" ]]
         then
             if kill -0 "${INFO[1]}" &>/dev/null
@@ -635,7 +653,7 @@ function acquire_remote_lock {
             elif [[ "${OPTIONS[*]}" =~ force ]]
             then
                 # Lock exists for this client but process is not running
-                echo -e "${YELLOW}Ignoring stale, remote lock file${CLEAR}"
+                echo -e "${YELLOW}Updating stale, remote lock file${CLEAR}"
                 # The lock will be cleaned up after the script. The sync will
                 # continue unless another lock file indicates that syncing
                 # should not proceed.
