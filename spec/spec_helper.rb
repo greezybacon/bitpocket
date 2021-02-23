@@ -63,7 +63,7 @@ end
 
 TEST_CASE = { :num => 0 }
 
-shared_context 'setup' do
+RSpec.shared_context 'setup' do
   before(:all) do
     @tmp_dir = "/tmp/bitpocket-test-#{Time.now.to_i}"
   end
@@ -78,6 +78,26 @@ shared_context 'setup' do
     Dir.chdir(@local_dir)
     FileUtils.mkdir_p("#{@local_dir}/.bitpocket")
     cat "REMOTE_PATH=#{@remote_dir}", local_path('.bitpocket/config')
+  end
+
+  let(:content) { 'foo' }
+end
+
+RSpec.shared_context 'setup_with_spaces_in_paths' do
+  before(:all) do
+    @tmp_dir = "/tmp/bitpocket-test-#{Time.now.to_i}"
+  end
+
+  before do
+    TEST_CASE[:num] += 1
+    test_case_dir = File.join(@tmp_dir, TEST_CASE[:num].to_s)
+    @local_dir = File.join(test_case_dir, 'lo cal')
+    @remote_dir = File.join(test_case_dir, 're mote')
+    FileUtils.mkdir_p(@local_dir)
+    FileUtils.mkdir_p(@remote_dir)
+    Dir.chdir(@local_dir)
+    FileUtils.mkdir_p("#{@local_dir}/.bitpocket")
+    cat "REMOTE_PATH='#{@remote_dir}'", local_path('.bitpocket/config')
   end
 
   let(:content) { 'foo' }
